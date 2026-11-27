@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Alteran // Voice</title>
+  <meta name="theme-color" content="#080C10" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <canvas id="field" aria-hidden="true"></canvas>
+  <div class="wrap">
+    <header>
+      <div class="brand">
+        <span class="label green">Alteran // not Mecha</span>
+        <h1>ALTERAN<span class="cyan">VOICE</span></h1>
+      </div>
+      <div class="status">
+        <span id="dot" class="dot"></span>
+        <span id="status" class="mono dim">connecting…</span>
+      </div>
+    </header>
+    <div id="dbg" class="mono dim" style="font-size:10px; margin:8px 0; max-height:120px; overflow:auto;"></div>
+
+    <main id="log" aria-live="polite">
+      <div class="msg alteran">
+        <div class="who">ALTERAN</div>
+        <div class="bubble">I speak from the site's own records — every article, every glossary entry, indexed on this machine. Ask me about the hive, retrieval, sovereign inference, or the Alteran line. Hold the mic and talk, or type.</div>
+      </div>
+    </main>
+
+    <footer>
+      <div id="viz" class="viz" hidden></div>
+      <div class="controls">
+        <button class="mode-toggle" id="modeToggle" title="Conversation mode (C)" aria-label="Toggle conversation mode">
+          <svg class="icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+          </svg>
+          <span class="label">conversation</span>
+        </button>
+        <button id="mic" class="mic" title="Click to talk (or press Space)">
+          <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+            <rect x="9" y="3" width="6" height="11" rx="3"/>
+            <path d="M5 11a7 7 0 0 0 14 0M12 18v3"/>
+          </svg>
+        </button>
+        <form id="textform" class="textform">
+          <input id="text" type="text" placeholder="…or type a question" autocomplete="off" />
+          <button type="submit" class="send" title="Send">→</button>
+        </form>
+        <select id="voice" class="voice mono" title="Orpheus voice"></select>
+        <div class="lang-toggle" id="langToggle" title="Language (L)" role="group" aria-label="Language">
+          <button class="lang-btn active" data-lang="en" aria-pressed="true">EN</button>
+          <button class="lang-btn" data-lang="sk" aria-pressed="false">SK</button>
+        </div>
+        <button id="reset" class="ghost mono" title="New session">reset</button>
+        <button id="settings" class="ghost mono" title="Set Groq API key">key</button>
+      </div>
+      <div class="conv-indicator" id="convIndicator" hidden>
+        <span class="pulse-ring"></span>
+        <span class="state-label" id="convState">listening…</span>
+      </div>
+      <div class="meta mono dim">
+        <span id="hint">cloudflare ai search (alteranai.com corpus) · groq whisper + orpheus for voice</span>
+        <span id="timings"></span>
+      </div>
+    </footer>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
