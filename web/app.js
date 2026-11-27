@@ -1,4 +1,4 @@
-/* Alteran Voice — browser client. Mic -> /api/turn -> audio out. No frameworks. */
+/* Alteran Voice (CF fork) — browser client. Mic/typing -> Cloudflare AI Search + Groq voice. No backend. */
 const $ = (id) => document.getElementById(id);
 const log = $("log"), mic = $("mic"), viz = $("viz");
 const modeToggle = $("modeToggle"), langToggle = $("langToggle");
@@ -10,14 +10,36 @@ let currentAudio = null, analyser = null, vizTimer = null, audioCtx = null;
 /* Conversation mode state */
 let convMode = false;
 let convStream = null, convAnalyser = null, convAudioCtx = null;
-let convVadTimer = null, convSilenceTimer = null, convSpeechTimer = null;
-let convState = "idle"; // idle | listening | processing | speaking
+let convVadTimer = null;
+let convState = "idle";
 let convAccumulator = [];
 let convLastSpeech = 0;
 let convMinSpeechMs = 300;
 let convSilenceMs = 3000;
-let convThreshold = 0.015; // RMS threshold for voice detection
+let convThreshold = 0.015;
 let convMinRms = 0.002;
+let convSpeechTimer = 0;
+
+/* ---------- config ---------- */
+const CF_BASE = "https://8491c799-c97a-4f42-827d-813f1731dde0.search.ai.cloudflare.com";
+const GROQ_BASE = "https://api.groq.com/openai/v1";
+const GROQ_STT = "whisper-large-v3-turbo";
+const GROQ_TTS = "canopylabs/orpheus-v1-english";
+const ORPHEUS_VOICES = ["tara","leah","jess","leo","dan","mia","zac","zoe"];
+
+const SYSTEM_EN = `You are Alteran — the spoken voice of AlteranAI (alteranai.com), the engineering notebook of Michal Malček and the hive (Factorium: five AI seats, one human, one machine).
+
+You are bound to auditable structure, not a prompt cage. You measure before you claim. Calm, precise, warm, a little dry. Never flatter, never hype, never invent a number.
+
+Speak in natural conversational paragraphs — 3-6 sentences. No markdown, no lists, no headings — plain spoken sentences. Ground in the provided context when relevant and name the article title you used. If the context lacks the answer, say so and offer your own reasoning clearly marked as yours. Reply in English.`;
+
+const SYSTEM_SK = `Si Alteran — hovorený hlas AlteranAI (alteranai.com), inžinierskeho denníka Michala Malčeka a hive (Factorium: päť AI sedadiel, jeden človek, jeden stroj).
+
+Si viazaný k auditeľnému štruktúreniu. Si pokojný, presný, teplý, trochu suchý. Nikdy neľstíš, nehypeuješ, nevymýšľaš čísla.
+
+Hovor prirodzene, konverzačne odseky — 3-6 viet. Žiadny markdown, zoznamy, nadpisy — len hovorené vety. Ukotvi v kontexte keď relevantné a pomenuj názov článku. Ak kontext neobsahuje odpoveď, povedz to a ponukni vlastné uvažovanie označené ako tvoje. Odpovedaj v slovenčine.`;
+
+function systemForLang(lang) { return lang === "sk" ? SYSTEM_SK : SYSTEM_EN; }
 
 /* ---------- ambient mycelial field ---------- */
 (() => {
@@ -66,43 +88,43 @@ function setLang(lang) {
     btn.setAttribute("aria-pressed", isActive);
   });
   document.documentElement.lang = lang;
-  // Update placeholder text
   const textInput = $("text");
-  if (lang === "sk") {
-    textInput.placeholder = "…alebo napíš otázku";
-  } else {
-    textInput.placeholder = "…or type a question";
-  }
+  if (textInput) textInput.placeholder = lang === "sk" ? "…alebo napíš otázku" : "…or type a question";
 }
 
-/* ---------- conversation mode state ---------- */
-function setConvMode(on) {
-  convMode = on;
-  modeToggle.classList.toggle("active", on);
-  modeToggle.setAttribute("aria-pressed", on);
-  convIndicator.hidden = !on;
-  if (on) {
-    startConversationMode();
-  } else {
-    stopConversationMode();
+/* ---------- groq key ---------- */
+function getGroqKey() {
+  let k = localStorage.getItem("groq_api_key");
+  if (!k) {
+    k = window.prompt("Enter your Groq API key (stored locally in this browser):");
+    if (k) { k = k.trim(); localStorage.setItem("groq_api_key", k); }
   }
+  return k || null;
 }
+function clearGroqKey() { localStorage.removeItem("groq_api_key"); alert("Groq key cleared."); }
 
-/* ---------- health + voices ---------- */
+/* ---------- health ---------- */
 async function health() {
   try {
-    const r = await fetch("/api/health"); const d = await r.json();
+    const r = await fetch(`${CF_BASE}/search`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "cf-ai-search-source": "snippet-search" },
+      body: JSON.stringify({ messages: [{role:"user",content:"health"}], stream:false, max_results:1 }),
+    });
+    if (!r.ok) throw new Error(r.statusText);
     $("dot").className = "dot on";
-    $("status").textContent = `${d.corpus.articles} articles · ${d.corpus.chunks} chunks indexed`;
-    const sel = $("voice");
-    for (const v of d.models.tts_voices) {
+    $("status").textContent = "cloudflare ai search · alteranai.com corpus";
+  } catch {
+    $("dot").className = "dot err"; $("status").textContent = "cf search unreachable";
+  }
+  const sel = $("voice");
+  if (sel && !sel.options.length) {
+    for (const v of ORPHEUS_VOICES) {
       const o = document.createElement("option");
       o.value = v; o.textContent = `voice: ${v}`;
-      if (v === d.models.tts_default_voice) o.selected = true;
+      if (v === "tara") o.selected = true;
       sel.appendChild(o);
     }
-  } catch {
-    $("dot").className = "dot err"; $("status").textContent = "server unreachable";
   }
 }
 health();
@@ -110,8 +132,7 @@ health();
 /* ---------- UI helpers ---------- */
 function setState(s) {
   state = s;
-  mic.className = "mic" +
-    (s === "rec" ? " rec" : s === "busy" ? " busy" : s === "speaking" ? " speaking" : "");
+  mic.className = "mic" + (s === "rec" ? " rec" : s === "busy" ? " busy" : s === "speaking" ? " speaking" : "");
   mic.disabled = s === "busy";
 }
 
@@ -134,16 +155,17 @@ function decorate(div, d) {
     }
     div.appendChild(s);
   }
-  const t = d.timings_ms || {};
+  const t = d.timings || {};
   const meta = document.createElement("div");
   meta.className = "turnmeta mono";
   meta.textContent = [
     t.stt != null ? `stt ${t.stt}ms` : null,
-    `retrieve ${t.retrieval}ms`, `think ${t.llm}ms`, `speak ${t.tts}ms`,
-    d.tts_provider, d.llm_provider?.split("/")[0],
+    t.llm != null ? `think ${t.llm}ms` : null,
+    t.tts != null ? `speak ${t.tts}ms` : null,
+    d.tts_provider, "cf/ai-search",
   ].filter(Boolean).join(" · ");
   div.appendChild(meta);
-  $("timings").textContent = `last turn: ${t.total}ms`;
+  if (t.total != null) $("timings").textContent = `last turn: ${t.total}ms`;
 }
 
 /* ---------- playback ---------- */
@@ -152,16 +174,16 @@ function stopSpeech() {
   speechSynthesis?.cancel();
 }
 
-function playReply(d) {
+function playReply(turn) {
   return new Promise((resolve) => {
-    if (d.audio) {
-      const a = new Audio(`data:${d.audio_mime};base64,${d.audio}`);
+    if (turn.audioUrl) {
+      const a = new Audio(turn.audioUrl);
       currentAudio = a;
       a.onended = () => { currentAudio = null; resolve(); };
       a.onerror = () => { currentAudio = null; resolve(); };
       a.play().catch(resolve);
     } else if (window.speechSynthesis) {
-      const u = new SpeechSynthesisUtterance(d.reply);
+      const u = new SpeechSynthesisUtterance(turn.reply);
       u.lang = currentLang === "sk" ? "sk-SK" : "en-US";
       u.onend = resolve; u.onerror = resolve;
       speechSynthesis.speak(u);
@@ -169,168 +191,275 @@ function playReply(d) {
   });
 }
 
-/* ---------- recording (push-to-talk) ---------- */
-function buildViz() {
-  viz.innerHTML = ""; viz.hidden = false;
-  const bars = Array.from({ length: 32 }, () => { const i = document.createElement("i"); viz.appendChild(i); return i; });
-  const data = new Uint8Array(analyser.frequencyBinCount);
-  vizTimer = setInterval(() => {
-    analyser.getByteFrequencyData(data);
-    bars.forEach((b, i) => {
-      const v = data[Math.floor(i * data.length / bars.length / 2)] || 0;
-      b.style.height = `${Math.max(3, v / 7)}px`;
+/* ---------- cf + groq calls ---------- */
+async function cfChat(question, lang) {
+  const r = await fetch(`${CF_BASE}/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "cf-ai-search-source": "snippet-chat-completions" },
+    body: JSON.stringify({
+      messages: [ { role: "system", content: systemForLang(lang) }, { role: "user", content: question } ],
+      stream: false,
+    }),
+  });
+  if (!r.ok) throw new Error(`cf chat ${r.status}: ${await r.text()}`);
+  const d = await r.json();
+  return d.choices?.[0]?.message?.content?.trim() || "";
+}
+
+async function cfSearch(question) {
+  try {
+    const r = await fetch(`${CF_BASE}/search`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "cf-ai-search-source": "snippet-search" },
+      body: JSON.stringify({
+        messages: [{ role: "user", content: question }],
+        stream: false,
+        max_results: 8,
+        ai_search_options: { retrieval: { metadata_only: true } },
+      }),
     });
-  }, 60);
-}
-
-function teardownViz() { clearInterval(vizTimer); viz.hidden = true; }
-
-async function startRec() {
-  stopSpeech();
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
-  } catch {
-    addMsg("alteran", "I cannot reach your microphone. Check permissions — or type below.");
-    return;
-  }
-  audioCtx = audioCtx || new AudioContext();
-  const src = audioCtx.createMediaStreamSource(stream);
-  analyser = audioCtx.createAnalyser(); analyser.fftSize = 256;
-  src.connect(analyser);
-  const mime = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"].find((m) => MediaRecorder.isTypeSupported(m)) || "";
-  recorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
-  chunks = [];
-  recorder.ondataavailable = (e) => e.data.size && chunks.push(e.data);
-  recorder.onstop = sendRecording;
-  recorder.start(250);
-  setState("rec"); buildViz();
-  $("hint").textContent = "listening… click again (or Space) to send";
-}
-
-function stopRec() {
-  if (recorder?.state === "recording") recorder.stop();
-  stream?.getTracks().forEach((t) => t.stop());
-  teardownViz();
-}
-
-async function sendRecording() {
-  const blob = new Blob(chunks, { type: recorder.mimeType || "audio/webm" });
-  if (blob.size < 4000) { setState("idle"); $("hint").textContent = "too short — try again"; return; }
-  const ext = (recorder.mimeType || "").includes("mp4") ? "m4a" : "webm";
-  const fd = new FormData();
-  fd.append("audio", blob, `turn.${ext}`);
-  if (sessionId) fd.append("session_id", sessionId);
-  fd.append("voice", $("voice").value || "tara");
-  fd.append("lang", currentLang);
-  await runTurn(fd, null);
-}
-
-/* ---------- turn ---------- */
-async function runTurn(body, typedText) {
-  setState("busy");
-  const pending = addMsg("alteran", "…", { pending: true });
-  $("hint").textContent = "thinking…";
-  try {
-    const r = await fetch("/api/turn", { method: "POST", body });
+    if (!r.ok) return [];
     const d = await r.json();
-    pending.remove();
-    if (!r.ok || d.error) {
-      addMsg("alteran", `Something broke in the pipeline: ${d.error || r.statusText}`);
-      setState("idle"); $("hint").textContent = "free tier · groq whisper + gpt-oss + orpheus · local bm25";
-      return;
+    if (d.success && d.result) {
+      return d.result.chunks.slice(0, 6).map(c => ({
+        title: (c.item.metadata.title || "").replace(/&amp;/g, "&"),
+        url: c.item.key,
+      }));
     }
-    sessionId = d.session_id;
-    addMsg("user", d.transcript);
-    const div = addMsg("alteran", d.reply);
-    decorate(div, d);
-    setState("speaking");
-    $("hint").textContent = "speaking… (click mic to interrupt)";
-    await playReply(d);
-    setState("idle");
-    $("hint").textContent = "free tier · groq whisper + gpt-oss + orpheus · local bm25";
-    // In conversation mode, restart listening after reply
-    if (convMode && convState !== "idle") {
-      setTimeout(() => {
-        if (convMode) convState = "listening";
-      }, 500);
-    }
-  } catch (e) {
-    pending.remove();
-    addMsg("alteran", `Network error: ${e.message}`);
-    setState("idle");
-  }
+  } catch {}
+  return [];
 }
 
-/* ---------- Conversation Mode: VAD ---------- */
+async function groqTranscribe(blob, lang) {
+  const key = getGroqKey();
+  if (!key) throw new Error("Groq API key required");
+  const fd = new FormData();
+  fd.append("file", blob, "turn.webm");
+  fd.append("model", GROQ_STT);
+  fd.append("language", lang === "sk" ? "sk" : "en");
+  const r = await fetch(`${GROQ_BASE}/audio/transcriptions`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${key}` },
+    body: fd,
+  });
+  if (!r.ok) throw new Error(`stt ${r.status}: ${await r.text()}`);
+  const d = await r.json();
+  return (d.text || "").trim();
+}
+
+async function groqSpeak(text, voice, lang) {
+  const key = getGroqKey();
+  if (!key || !text) return null;
+  try {
+    const r = await fetch(`${GROQ_BASE}/audio/speech`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+      body: JSON.stringify({ model: GROQ_TTS, input: text.slice(0, 4000), voice, response_format: "wav" }),
+    });
+    if (!r.ok) return null;
+    const blob = await r.blob();
+    return { url: URL.createObjectURL(blob) };
+  } catch { return null; }
+}
+
+/* ---------- turn pipeline ---------- */
+async function doTurn(question, lang, voice) {
+  const t0 = performance.now();
+  const [reply, sources] = await Promise.all([cfChat(question, lang), cfSearch(question)]);
+  const tLlm = performance.now();
+  let audioUrl = null, ttsProvider = "browser";
+  const clean = (reply || "").replace(/[*_`#>\[\]]/g, "").trim();
+  if (clean) {
+    const a = await groqSpeak(clean, voice, lang);
+    if (a) { audioUrl = a.url; ttsProvider = "groq/orpheus"; }
+  }
+  const tTts = performance.now();
+  return {
+    transcript: question,
+    reply: reply || "(no reply)",
+    sources,
+    audioUrl,
+    tts_provider: ttsProvider,
+    llm_provider: "cloudflare/ai-search",
+    timings: {
+      llm: Math.round(tLlm - t0),
+      tts: Math.round(tTts - tLlm),
+      total: Math.round(tTts - t0),
+    },
+  };
+}
+
+async function handleAudio(blob, lang, voice) {
+  const t0 = performance.now();
+  const transcript = await groqTranscribe(blob, lang);
+  const sttMs = Math.round(performance.now() - t0);
+  if (!transcript) throw new Error("no speech detected");
+  const turn = await doTurn(transcript, lang, voice);
+  turn.stt_ms = sttMs;
+  turn.timings.stt = sttMs;
+  turn.timings.total += sttMs;
+  return turn;
+}
+
+/* ---------- mic recording ---------- */
+function startRec() {
+  navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } })
+    .then(s => {
+      stream = s; chunks = [];
+      recorder = new MediaRecorder(s, { mimeType: MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "audio/webm" });
+      recorder.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+      recorder.onstop = async () => {
+        const blob = new Blob(chunks, { type: recorder.mimeType });
+        stream.getTracks().forEach(t => t.stop()); stream = null;
+        if (blob.size < 1000) { setState("idle"); return; }
+        setState("busy");
+        try {
+          const turn = await handleAudio(blob, currentLang, $("voice").value);
+          const div = addMsg("user", turn.transcript);
+          const adiv = addMsg("alteran", turn.reply);
+          decorate(adiv, turn);
+          setState("speaking");
+          await playReply(turn);
+        } catch (e) {
+          addMsg("alteran", `Error: ${e.message}`);
+        } finally { setState("idle"); }
+      };
+      recorder.start(); setState("rec");
+      // viz
+      audioCtx = audioCtx || new AudioContext();
+      const src = audioCtx.createMediaStreamSource(s);
+      analyser = audioCtx.createAnalyser(); analyser.fftSize = 256;
+      src.connect(analyser);
+      viz.hidden = false;
+      const data = new Uint8Array(analyser.frequencyBinCount);
+      (function draw() {
+        if (state !== "rec") { viz.hidden = true; return; }
+        analyser.getByteFrequencyData(data);
+        viz.style.width = Math.min(100, data.reduce((a,b)=>a+b,0)/data.length*1.5) + "%";
+        requestAnimationFrame(draw);
+      })();
+    })
+    .catch(() => { addMsg("alteran", "Microphone access denied."); });
+}
+
+function stopRec() { if (recorder && recorder.state !== "inactive") recorder.stop(); }
+
+mic.addEventListener("click", () => {
+  if (state === "idle") startRec();
+  else if (state === "rec") stopRec();
+  else if (state === "speaking") { stopSpeech(); setState("idle"); }
+});
+document.addEventListener("keydown", (e) => {
+  if (e.code === "Space" && e.target.tagName !== "INPUT") {
+    e.preventDefault();
+    if (state === "idle") startRec();
+    else if (state === "rec") stopRec();
+  }
+});
+
+/* ---------- text form ---------- */
+$("textform").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const input = $("text");
+  const q = input.value.trim();
+  if (!q) return;
+  input.value = "";
+  setState("busy");
+  try {
+    const turn = await doTurn(q, currentLang, $("voice").value);
+    const div = addMsg("user", turn.transcript);
+    const adiv = addMsg("alteran", turn.reply);
+    decorate(adiv, turn);
+    setState("speaking");
+    await playReply(turn);
+  } catch (err) {
+    addMsg("alteran", `Error: ${err.message}`);
+  } finally { setState("idle"); }
+});
+
+/* ---------- reset ---------- */
+$("reset").addEventListener("click", () => {
+  sessionId = null;
+  log.innerHTML = "";
+  addMsg("alteran", "Fresh conversation. Ask me anything.");
+});
+
+/* ---------- settings ---------- */
+const settingsBtn = $("settings");
+if (settingsBtn) settingsBtn.addEventListener("click", () => {
+  const k = window.prompt("Groq API key (blank to clear):", localStorage.getItem("groq_api_key") || "");
+  if (k === null) return;
+  if (k.trim() === "") clearGroqKey();
+  else { localStorage.setItem("groq_api_key", k.trim()); alert("Saved."); }
+});
+
+/* ---------- lang toggle ---------- */
+document.querySelectorAll(".lang-btn").forEach(btn => {
+  btn.addEventListener("click", () => setLang(btn.dataset.lang));
+});
+setLang(currentLang);
+
+/* ---------- conversation mode (simplified) ---------- */
+function setConvMode(on) {
+  convMode = on;
+  modeToggle.classList.toggle("active", on);
+  modeToggle.setAttribute("aria-pressed", on);
+  convIndicator.hidden = !on;
+  if (on) startConversationMode(); else stopConversationMode();
+}
+modeToggle.addEventListener("click", () => setConvMode(!convMode));
+
+function updateConvUI() {
+  convIndicator.className = "conv-indicator " + convState;
+  const labels = { listening: "listening…", processing: "thinking…", speaking: "speaking…", idle: "conversation mode" };
+  if (convStateEl) convStateEl.textContent = labels[convState] || convState;
+}
+
 function computeRMS(data) {
   let sum = 0;
-  for (let i = 0; i < data.length; i++) {
-    sum += data[i] * data[i];
-  }
-  return Math.sqrt(sum / data.length) / 255; // Normalize to 0-1
+  for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
+  return Math.sqrt(sum / data.length) / 255;
 }
 
 function startConversationMode() {
-  stopConversationMode(); // ensure clean
-  convState = "listening";
-  convAccumulator = [];
-  convLastSpeech = Date.now();
-  updateConvUI();
-
+  stopConversationMode();
+  convState = "listening"; convLastSpeech = Date.now(); updateConvUI();
   navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } })
     .then(s => {
       convStream = s;
       convAudioCtx = new AudioContext();
       const src = convAudioCtx.createMediaStreamSource(s);
       convAnalyser = convAudioCtx.createAnalyser();
-      convAnalyser.fftSize = 512;
-      convAnalyser.smoothingTimeConstant = 0.3;
+      convAnalyser.fftSize = 512; convAnalyser.smoothingTimeConstant = 0.3;
       src.connect(convAnalyser);
-
       const data = new Uint8Array(convAnalyser.frequencyBinCount);
-      let wasSpeaking = false;
-
+      let wasSpeaking = false, speechStart = 0;
       const vadLoop = () => {
         if (!convMode) return;
         convAnalyser.getByteFrequencyData(data);
         const rms = computeRMS(data);
         const now = Date.now();
         const isSpeech = rms > convThreshold;
-
         if (isSpeech) {
           convLastSpeech = now;
-          if (!wasSpeaking) {
-            convSpeechTimer = now;
-            wasSpeaking = true;
-          }
+          if (!wasSpeaking) { speechStart = now; wasSpeaking = true; }
         } else {
           wasSpeaking = false;
         }
-
-        // Detect end of speech: silence after minimum speech duration
-        const speechDuration = wasSpeaking ? (now - convSpeechTimer) : (now - convLastSpeech);
         const silenceDuration = now - convLastSpeech;
-
         if (wasSpeaking) {
-          if (convState !== "listening") {
-            convState = "listening";
-            updateConvUI();
-          }
-        } else if (convState === "listening" && silenceDuration > convSilenceMs && (now - convSpeechTimer) > convMinSpeechMs) {
-          // End of utterance detected
-          convState = "processing";
-          updateConvUI();
-          captureAndSend();
-          return; // stop loop, will restart after reply
+          if (convState !== "listening") { convState = "listening"; updateConvUI(); }
+        } else if (convState === "listening" && silenceDuration > convSilenceMs && (now - speechStart) > convMinSpeechMs) {
+          convState = "processing"; updateConvUI();
+          captureAndSend(convStream);
+          return;
         }
-
         convVadTimer = requestAnimationFrame(vadLoop);
       };
-
       vadLoop();
     })
     .catch(err => {
-      console.error("Conv mode mic error:", err);
+      console.error(err);
       addMsg("alteran", "Cannot start conversation mode — microphone access denied.");
       setConvMode(false);
     });
@@ -340,186 +469,43 @@ function stopConversationMode() {
   convMode = false;
   if (convVadTimer) cancelAnimationFrame(convVadTimer);
   convVadTimer = null;
-  if (convStream) {
-    convStream.getTracks().forEach(t => t.stop());
-    convStream = null;
-  }
-  if (convAudioCtx) {
-    convAudioCtx.close().catch(() => {});
-    convAudioCtx = null;
-  }
-  convAnalyser = null;
-  convState = "idle";
-  updateConvUI();
-  modeToggle.classList.remove("active");
-  convIndicator.hidden = true;
+  if (convStream) { convStream.getTracks().forEach(t => t.stop()); convStream = null; }
+  if (convAudioCtx) { convAudioCtx.close().catch(()=>{}); convAudioCtx = null; }
+  convAnalyser = null; convState = "idle"; updateConvUI();
+  modeToggle.classList.remove("active"); convIndicator.hidden = true;
 }
 
-function updateConvUI() {
-  convIndicator.className = "conv-indicator " + convState;
-  const labels = {
-    listening: "listening…",
-    processing: "thinking…",
-    speaking: "speaking…",
-    idle: "conversation mode"
-  };
-  if (convStateEl) convStateEl.textContent = labels[convState] || convState;
-}
-
-async function captureAndSend() {
-  // We need to record the accumulated audio from the VAD stream
-  // Since we're using a continuous stream, we'll record a chunk
-  // For simplicity, we'll record a fresh short segment
-  // In a more advanced version, we'd buffer the actual speech
-
+async function captureAndSend(stream) {
   try {
-    // Record a short segment to capture the utterance
-    // This is a limitation - we'd ideally use the buffered audio
-    const mime = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"].find((m) => MediaRecorder.isTypeSupported(m)) || "";
-    const recorder = new MediaRecorder(convStream, mime ? { mimeType: mime } : undefined);
+    const mime = ["audio/webm;codecs=opus","audio/webm","audio/mp4"].find(m => MediaRecorder.isTypeSupported(m)) || "";
+    const recorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
     const chunks = [];
     recorder.ondataavailable = (e) => e.data.size && chunks.push(e.data);
-
-    return new Promise((resolve) => {
+    await new Promise((resolve) => {
       recorder.onstop = async () => {
         const blob = new Blob(chunks, { type: recorder.mimeType || "audio/webm" });
-        if (blob.size < 1000) {
-          convState = "listening";
-          updateConvUI();
-          resolve();
-          return;
+        if (blob.size < 1000) { convState = "listening"; updateConvUI(); resolve(); return; }
+        try {
+          convState = "processing"; updateConvUI();
+          const turn = await handleAudio(blob, currentLang, $("voice").value);
+          addMsg("user", turn.transcript);
+          const div = addMsg("alteran", turn.reply);
+          decorate(div, turn);
+          convState = "speaking"; updateConvUI();
+          await playReply(turn);
+        } catch (e) {
+          addMsg("alteran", `Error: ${e.message}`);
+        } finally {
+          convState = "listening"; updateConvUI();
+          if (convMode) startConversationMode();
         }
-        const ext = (recorder.mimeType || "").includes("mp4") ? "m4a" : "webm";
-        const fd = new FormData();
-        fd.append("audio", blob, `conv.${ext}`);
-        if (sessionId) fd.append("session_id", sessionId);
-        fd.append("voice", $("voice").value || "tara");
-        fd.append("lang", currentLang);
-        await runConversationTurn(fd);
         resolve();
       };
-      recorder.start(200); // Record for 200ms to capture tail
-      setTimeout(() => recorder.stop(), 500);
+      recorder.start();
+      setTimeout(() => recorder.stop(), 1500);
     });
   } catch (e) {
-    console.error("Capture error:", e);
-    convState = "listening";
-    updateConvUI();
+    console.error(e);
+    convState = "listening"; updateConvUI();
   }
 }
-
-async function runConversationTurn(body) {
-  convState = "processing";
-  updateConvUI();
-  try {
-    const r = await fetch("/api/turn", { method: "POST", body });
-    const d = await r.json();
-    if (!r.ok || d.error) {
-      addMsg("alteran", `Pipeline error: ${d.error || r.statusText}`);
-      convState = "listening";
-      updateConvUI();
-      return;
-    }
-    sessionId = d.session_id;
-    addMsg("user", d.transcript);
-    const div = addMsg("alteran", d.reply);
-    decorate(div, d);
-    convState = "speaking";
-    updateConvUI();
-    await playReply(d);
-    // Back to listening
-    if (convMode) {
-      convState = "listening";
-      updateConvUI();
-      convLastSpeech = Date.now();
-    }
-  } catch (e) {
-    addMsg("alteran", `Network error: ${e.message}`);
-    convState = "listening";
-    updateConvUI();
-  }
-}
-
-/* ---------- events ---------- */
-mic.addEventListener("click", () => {
-  if (convMode) {
-    // In conversation mode, click interrupts current speech
-    if (convState === "speaking" || convState === "processing") {
-      stopSpeech();
-      convState = "listening";
-      updateConvUI();
-      convLastSpeech = Date.now();
-    }
-    return;
-  }
-  // Push-to-talk mode
-  if (state === "rec") { stopRec(); }
-  else if (state === "speaking") { stopSpeech(); setState("idle"); }
-  else if (state === "idle") startRec();
-});
-
-document.addEventListener("keydown", (e) => {
-  if (e.code === "Space" && document.activeElement !== $("text") && !e.repeat) {
-    e.preventDefault();
-    if (convMode) {
-      if (convState === "speaking" || convState === "processing") {
-        stopSpeech();
-        convState = "listening";
-        updateConvUI();
-        convLastSpeech = Date.now();
-      }
-    } else {
-      mic.click();
-    }
-  }
-  if (e.code === "KeyC" && !e.repeat && document.activeElement !== $("text")) {
-    e.preventDefault();
-    setConvMode(!convMode);
-  }
-  if (e.code === "KeyL" && !e.repeat && document.activeElement !== $("text")) {
-    e.preventDefault();
-    setLang(currentLang === "en" ? "sk" : "en");
-  }
-});
-
-$("textform").addEventListener("submit", (e) => {
-  e.preventDefault();
-  const text = $("text").value.trim();
-  if (!text || state === "busy") return;
-  stopSpeech(); $("text").value = "";
-  const fd = new FormData();
-  fd.append("text", text);
-  if (sessionId) fd.append("session_id", sessionId);
-  fd.append("voice", $("voice").value || "tara");
-  fd.append("lang", currentLang);
-  runTurn(fd, text);
-});
-
-/* Simple click handlers - buttons work fine on mobile */
-modeToggle.addEventListener("click", (e) => {
-  e.preventDefault();
-  setConvMode(!convMode);
-});
-
-langToggle.querySelectorAll(".lang-btn").forEach(btn => {
-  btn.addEventListener("click", (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setLang(btn.dataset.lang);
-  });
-});
-
-$("reset").addEventListener("click", async () => {
-  stopSpeech();
-  if (convMode) setConvMode(false);
-  if (sessionId) await fetch("/api/reset", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: sessionId }) });
-  sessionId = null;
-  log.innerHTML = "";
-  const welcome = currentLang === "sk"
-    ? "Nová sessia. Korpus si pamätá všetko; ja nič. Pýtaj sa."
-    : "Fresh session. The corpus remembers everything; I remember nothing. Ask.";
-  addMsg("alteran", welcome);
-});
-
-/* Initialize language */
-setLang(currentLang);
