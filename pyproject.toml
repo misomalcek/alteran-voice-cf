@@ -1,5 +1,5 @@
 [project]
-name = "alteran-voice"
+name = "alteran-voice-cf"
 version = "0.1.0"
 description = "Alteran voice agent — free-tier STT/LLM/TTS over the alteranai.com corpus"
 requires-python = ">=3.11"
