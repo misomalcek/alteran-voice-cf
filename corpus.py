@@ -7,6 +7,7 @@ over the same files the website is built from. The structure is auditable.
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,7 +16,17 @@ import yaml
 from rank_bm25 import BM25Okapi
 
 SITE = "https://alteranai.com"
-REPO = Path(__file__).resolve().parent.parent
+# The voice app normally lives inside the AlteranAI site repo (voice/). Allow
+# overriding the site root via env so it can run standalone.
+_here = Path(__file__).resolve().parent
+if os.environ.get("ALTERAN_REPO"):
+    REPO = Path(os.environ["ALTERAN_REPO"])
+elif (_here / "src").is_dir():
+    REPO = _here
+elif (_here.parent / "src").is_dir():
+    REPO = _here.parent
+else:
+    REPO = _here.parent
 ARTICLES = REPO / "src" / "content" / "articles"
 ENTITIES_TS = REPO / "src" / "data" / "entities.ts"
 SITE_TS = REPO / "src" / "data" / "site.ts"
@@ -89,6 +100,8 @@ def _sections(body: str) -> list[tuple[str, str]]:
 
 def _article_chunks() -> list[Chunk]:
     chunks: list[Chunk] = []
+    if not ARTICLES.is_dir():
+        return chunks
     for path in sorted(ARTICLES.glob("*.md")):
         meta, body = _frontmatter(path.read_text(encoding="utf-8"))
         if meta.get("status", "draft") != "published":
@@ -114,8 +127,10 @@ def _article_chunks() -> list[Chunk]:
 
 
 def _entity_chunks() -> list[Chunk]:
-    src = ENTITIES_TS.read_text(encoding="utf-8")
     chunks: list[Chunk] = []
+    if not ENTITIES_TS.is_file():
+        return chunks
+    src = ENTITIES_TS.read_text(encoding="utf-8")
     for kind, block in (("tool", "TOOLS"), ("concept", "CONCEPTS")):
         m = re.search(rf"export const {block}: Entity\[\] = \[(.*?)\n\];", src, re.DOTALL)
         if not m:
@@ -136,8 +151,10 @@ def _entity_chunks() -> list[Chunk]:
 
 
 def _taxonomy_chunks() -> list[Chunk]:
-    src = SITE_TS.read_text(encoding="utf-8")
     chunks: list[Chunk] = []
+    if not SITE_TS.is_file():
+        return chunks
+    src = SITE_TS.read_text(encoding="utf-8")
     for block, kind, base in (("categories", "category", "categories"), ("clusters", "cluster", "clusters")):
         m = re.search(rf"export const {block} = \[(.*?)\] as const;", src, re.DOTALL)
         if not m:
